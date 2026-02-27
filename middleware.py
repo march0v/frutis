@@ -10,6 +10,7 @@ BASE_PATH = os.getenv("FRUTIS_BASE_PATH", "/opt/frutis")
 SERVER_HOST = os.getenv("FRUTIS_BIND_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("FRUTIS_PORT", "5000"))
 CATALOGO_PATH = f"{BASE_PATH}/datos/catalogo_productos.txt"
+STOCK_PATH = f"{BASE_PATH}/datos/stock_actual.txt"
 
 SESSION_TTL_SECONDS = 3600
 LOGIN_WINDOW_SECONDS = 300
@@ -242,6 +243,81 @@ def format_catalog(catalog):
     return "\n".join(rows)
 
 
+def parse_stock_line(line):
+    parts = [x.strip() for x in line.strip().split("|")]
+    if len(parts) != 4:
+        return None
+
+    nombre, unidad, cantidad_raw, precio_raw = parts
+    if not nombre or unidad not in ALLOWED_UNITS:
+        return None
+
+    try:
+        cantidad = float(cantidad_raw)
+    except (TypeError, ValueError):
+        return None
+
+    if cantidad < 0:
+        return None
+
+    precio = parse_positive_number(precio_raw)
+    if precio is None:
+        return None
+
+    return {
+        "nombre": nombre,
+        "key": normalize_product(nombre),
+        "unidad": unidad,
+        "cantidad": cantidad,
+        "precio": precio,
+    }
+
+
+def load_stock():
+    stock = {}
+    if not os.path.exists(STOCK_PATH):
+        return stock
+
+    try:
+        with open(STOCK_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                parsed = parse_stock_line(line)
+                if not parsed:
+                    continue
+                stock[parsed["key"]] = parsed
+    except OSError as exc:
+        print("ERROR STOCK:", exc)
+
+    return stock
+
+
+def save_stock(stock):
+    lines = []
+    for key in sorted(stock.keys()):
+        item = stock[key]
+        lines.append(
+            f"{item['nombre']}|{item['unidad']}|{item['cantidad']:.2f}|{item['precio']:.2f}\n"
+        )
+
+    with open(STOCK_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def format_stock(stock):
+    if not stock:
+        return "Sin inventario"
+
+    rows = ["PRODUCTO|UNIDAD|STOCK|PRECIO"]
+    for key in sorted(stock.keys()):
+        item = stock[key]
+        rows.append(
+            f"{item['nombre']}|{item['unidad']}|{item['cantidad']:.2f}|{item['precio']:.2f}"
+        )
+    return "\n".join(rows)
+
+
 def send_and_close(cliente, payload):
     try:
         if isinstance(payload, bytes):
@@ -414,16 +490,42 @@ while True:
             send_and_close(cliente, b"Unidad no coincide con producto")
             continue
 
+        stock = load_stock()
+        stock_item = stock.get(key)
+        if not stock_item:
+            send_and_close(cliente, b"Sin stock disponible para ese producto")
+            continue
+
+        if stock_item["unidad"] != item["unidad"]:
+            send_and_close(cliente, b"Error de consistencia de unidad en stock")
+            continue
+
+        disponible = stock_item["cantidad"]
+        if cantidad > disponible:
+            send_and_close(
+                cliente,
+                f"Stock insuficiente. Disponible: {disponible:.2f} {stock_item['unidad']}",
+            )
+            continue
+
+        stock_item["cantidad"] = max(0.0, disponible - cantidad)
+        stock_item["precio"] = item["precio"]
+
         total = cantidad * item["precio"]
         detalle = (
             f"{fecha} | {addr} | VENTA|{usuario_cmd}|{item['nombre']}|"
-            f"{cantidad:.2f}|{item['unidad']}|{item['precio']:.2f}|{total:.2f}\n"
+            f"{cantidad:.2f}|{item['unidad']}|{item['precio']:.2f}|{total:.2f}|"
+            f"RESTANTE={stock_item['cantidad']:.2f}\n"
         )
 
         try:
+            save_stock(stock)
             with open(f"{BASE_PATH}/datos/ventas.txt", "a", encoding="utf-8") as f:
                 f.write(detalle)
-            send_and_close(cliente, f"Venta registrada|TOTAL={total:.2f}")
+            send_and_close(
+                cliente,
+                f"Venta registrada|TOTAL={total:.2f}|STOCK={stock_item['cantidad']:.2f}",
+            )
         except OSError:
             send_and_close(cliente, b"Error registrando venta")
         continue
@@ -460,15 +562,34 @@ while True:
             send_and_close(cliente, b"Unidad no coincide con producto")
             continue
 
+        stock = load_stock()
+        stock_item = stock.get(key)
+        if stock_item:
+            if stock_item["unidad"] != item["unidad"]:
+                send_and_close(cliente, b"Error de consistencia de unidad en stock")
+                continue
+            stock_item["cantidad"] += cantidad
+            stock_item["precio"] = item["precio"]
+        else:
+            stock[key] = {
+                "nombre": item["nombre"],
+                "key": key,
+                "unidad": item["unidad"],
+                "cantidad": cantidad,
+                "precio": item["precio"],
+            }
+
         detalle = (
             f"{fecha} | {addr} | INVENTARIO|{usuario_cmd}|{item['nombre']}|"
             f"{cantidad:.2f}|{item['unidad']}|{item['precio']:.2f}\n"
         )
 
         try:
+            save_stock(stock)
             with open(f"{BASE_PATH}/datos/inventario.txt", "a", encoding="utf-8") as f:
                 f.write(detalle)
-            send_and_close(cliente, b"Inventario actualizado")
+            actual = stock[key]["cantidad"]
+            send_and_close(cliente, f"Inventario actualizado|STOCK={actual:.2f}")
         except OSError:
             send_and_close(cliente, b"Error actualizando inventario")
         continue
@@ -508,8 +629,7 @@ while True:
             continue
 
         try:
-            with open(f"{BASE_PATH}/datos/inventario.txt", "r", encoding="utf-8") as f:
-                send_and_close(cliente, f.read())
+            send_and_close(cliente, format_stock(load_stock()))
         except OSError:
             send_and_close(cliente, b"Sin inventario")
 
