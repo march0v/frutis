@@ -6,7 +6,9 @@ import socket
 import ssl
 import time
 
-BASE_PATH = "/opt/frutis"
+BASE_PATH = os.getenv("FRUTIS_BASE_PATH", "/opt/frutis")
+SERVER_HOST = os.getenv("FRUTIS_BIND_HOST", "0.0.0.0")
+SERVER_PORT = int(os.getenv("FRUTIS_PORT", "5000"))
 
 SESSION_TTL_SECONDS = 3600
 LOGIN_WINDOW_SECONDS = 300
@@ -14,6 +16,9 @@ MAX_LOGIN_ATTEMPTS = 5
 
 failed_login_attempts = {}
 sessions = {}
+
+os.makedirs(f"{BASE_PATH}/logs", exist_ok=True)
+os.makedirs(f"{BASE_PATH}/datos", exist_ok=True)
 
 
 # ================= PASSWORD HASH =================
@@ -180,10 +185,13 @@ def send_and_close(cliente, payload):
 
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.minimum_version = ssl.TLSVersion.TLSv1_2
-context.load_cert_chain(certfile="server.crt", keyfile="server.key")
+context.load_cert_chain(
+    certfile=os.getenv("FRUTIS_CERT_PATH", "server.crt"),
+    keyfile=os.getenv("FRUTIS_KEY_PATH", "server.key"),
+)
 
 bindsocket = socket.socket()
-bindsocket.bind(("0.0.0.0", 5000))
+bindsocket.bind((SERVER_HOST, SERVER_PORT))
 bindsocket.listen(5)
 
 print(" FRUTIS Middleware activo...")

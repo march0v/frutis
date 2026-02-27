@@ -1,10 +1,11 @@
+import os
 import socket
 import ssl
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
-SERVER_IP = "172.25.250.11"
-SERVER_PORT = 5000
+SERVER_IP = os.getenv("FRUTIS_SERVER_IP", "172.25.250.11")
+SERVER_PORT = int(os.getenv("FRUTIS_SERVER_PORT", "5000"))
 
 
 def enviar(data):
