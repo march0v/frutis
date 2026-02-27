@@ -9,10 +9,13 @@ import time
 BASE_PATH = os.getenv("FRUTIS_BASE_PATH", "/opt/frutis")
 SERVER_HOST = os.getenv("FRUTIS_BIND_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("FRUTIS_PORT", "5000"))
+CATALOGO_PATH = f"{BASE_PATH}/datos/catalogo_productos.txt"
 
 SESSION_TTL_SECONDS = 3600
 LOGIN_WINDOW_SECONDS = 300
 MAX_LOGIN_ATTEMPTS = 5
+
+ALLOWED_UNITS = {"kilos", "unidades"}
 
 failed_login_attempts = {}
 sessions = {}
@@ -42,7 +45,6 @@ def verify_pass(password, stored_hash):
 
     stored_hash = stored_hash.strip()
 
-    # Backward compatibility for legacy SHA256 hashes.
     if "$" not in stored_hash:
         legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
         return secrets.compare_digest(legacy, stored_hash)
@@ -137,8 +139,6 @@ def obtener_sesion(token):
 
 
 def extraer_comando_autenticado(data):
-    # Required format for all non-login actions:
-    # TOKEN|<session_token>|<actual_command>
     partes = data.split("|", 2)
     if len(partes) < 3 or partes[0] != "TOKEN":
         return None, None
@@ -164,6 +164,82 @@ def valid_field(value, max_len=64):
 
     blocked = [",", "|", "\n", "\r", "\t"]
     return all(ch not in value for ch in blocked)
+
+
+def parse_positive_number(raw, max_value=1000000.0):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+
+    if value <= 0 or value > max_value:
+        return None
+
+    return value
+
+
+def normalize_product(value):
+    return " ".join(value.strip().split()).lower()
+
+
+def parse_catalog_line(line):
+    parts = [x.strip() for x in line.strip().split("|")]
+    if len(parts) != 3:
+        return None
+
+    nombre, unidad, precio_raw = parts
+    unidad = unidad.lower()
+    precio = parse_positive_number(precio_raw)
+    if not nombre or unidad not in ALLOWED_UNITS or precio is None:
+        return None
+
+    return {
+        "nombre": nombre,
+        "key": normalize_product(nombre),
+        "unidad": unidad,
+        "precio": precio,
+    }
+
+
+def load_catalog():
+    catalog = {}
+    if not os.path.exists(CATALOGO_PATH):
+        return catalog
+
+    try:
+        with open(CATALOGO_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                parsed = parse_catalog_line(line)
+                if not parsed:
+                    continue
+                catalog[parsed["key"]] = parsed
+    except OSError as exc:
+        print("ERROR CATALOGO:", exc)
+
+    return catalog
+
+
+def save_catalog(catalog):
+    lines = []
+    for key in sorted(catalog.keys()):
+        item = catalog[key]
+        lines.append(f"{item['nombre']}|{item['unidad']}|{item['precio']:.2f}\n")
+
+    with open(CATALOGO_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def format_catalog(catalog):
+    if not catalog:
+        return "Sin productos"
+
+    rows = ["PRODUCTO|UNIDAD|PRECIO"]
+    for key in sorted(catalog.keys()):
+        item = catalog[key]
+        rows.append(f"{item['nombre']}|{item['unidad']}|{item['precio']:.2f}")
+    return "\n".join(rows)
 
 
 def send_and_close(cliente, payload):
@@ -252,56 +328,146 @@ while True:
     safe_data = sanitize_log_value(command)
     log_entry = f"{fecha} | {addr} | {safe_data}\n"
 
-    # ================= LOG GENERAL =================
     try:
         with open(f"{BASE_PATH}/logs/log_general.txt", "a", encoding="utf-8") as f:
             f.write(log_entry)
     except OSError as exc:
         print("ERROR LOG GENERAL:", exc)
 
-    # ================= REGISTRAR VENTA =================
-    if command.startswith("VENTA"):
+    # ================= LISTAR PRODUCTOS =================
+    if command == "LISTAR_PRODUCTOS":
+        catalog = load_catalog()
+        send_and_close(cliente, format_catalog(catalog))
+        continue
+
+    # ================= CONFIGURAR PRODUCTO (ADMIN) =================
+    if command.startswith("SET_PRODUCTO"):
+        if sesion["rol"] != "admin":
+            send_and_close(cliente, b"No autorizado")
+            continue
+
         partes = command.split("|", 3)
         if len(partes) != 4:
+            send_and_close(cliente, b"Formato invalido. Use: SET_PRODUCTO|producto|unidad|precio")
+            continue
+
+        _, producto, unidad_raw, precio_raw = [p.strip() for p in partes]
+        unidad = unidad_raw.lower()
+
+        if not valid_field(producto, max_len=120):
+            send_and_close(cliente, b"Nombre de producto invalido")
+            continue
+
+        if unidad not in ALLOWED_UNITS:
+            send_and_close(cliente, b"Unidad invalida. Use kilos o unidades")
+            continue
+
+        precio = parse_positive_number(precio_raw)
+        if precio is None:
+            send_and_close(cliente, b"Precio invalido")
+            continue
+
+        try:
+            catalog = load_catalog()
+            key = normalize_product(producto)
+            catalog[key] = {
+                "nombre": producto,
+                "key": key,
+                "unidad": unidad,
+                "precio": precio,
+            }
+            save_catalog(catalog)
+            send_and_close(cliente, b"Producto actualizado")
+        except OSError:
+            send_and_close(cliente, b"Error guardando producto")
+        continue
+
+    # ================= REGISTRAR VENTA =================
+    if command.startswith("VENTA"):
+        partes = command.split("|", 4)
+        if len(partes) != 5:
             send_and_close(cliente, b"Formato invalido de venta")
             continue
 
-        _, usuario_cmd, producto, cantidad = [p.strip() for p in partes]
+        _, usuario_cmd, producto, cantidad_raw, unidad_cmd = [p.strip() for p in partes]
         if usuario_cmd != sesion["user"] and sesion["rol"] != "admin":
             send_and_close(cliente, b"No autorizado")
             continue
 
-        if not valid_field(producto, max_len=120) or not valid_field(cantidad, max_len=32):
-            send_and_close(cliente, b"Datos invalidos")
+        if not valid_field(producto, max_len=120):
+            send_and_close(cliente, b"Producto invalido")
             continue
+
+        cantidad = parse_positive_number(cantidad_raw)
+        if cantidad is None:
+            send_and_close(cliente, b"Cantidad invalida")
+            continue
+
+        catalog = load_catalog()
+        key = normalize_product(producto)
+        item = catalog.get(key)
+        if not item:
+            send_and_close(cliente, b"Producto no configurado por admin")
+            continue
+
+        if unidad_cmd.lower() != item["unidad"]:
+            send_and_close(cliente, b"Unidad no coincide con producto")
+            continue
+
+        total = cantidad * item["precio"]
+        detalle = (
+            f"{fecha} | {addr} | VENTA|{usuario_cmd}|{item['nombre']}|"
+            f"{cantidad:.2f}|{item['unidad']}|{item['precio']:.2f}|{total:.2f}\n"
+        )
 
         try:
             with open(f"{BASE_PATH}/datos/ventas.txt", "a", encoding="utf-8") as f:
-                f.write(log_entry)
-            send_and_close(cliente, b"Venta registrada")
+                f.write(detalle)
+            send_and_close(cliente, f"Venta registrada|TOTAL={total:.2f}")
         except OSError:
             send_and_close(cliente, b"Error registrando venta")
         continue
 
     # ================= REGISTRAR INVENTARIO =================
     if command.startswith("INVENTARIO"):
-        partes = command.split("|", 3)
-        if len(partes) != 4:
+        partes = command.split("|", 4)
+        if len(partes) != 5:
             send_and_close(cliente, b"Formato invalido de inventario")
             continue
 
-        _, usuario_cmd, producto, cantidad = [p.strip() for p in partes]
+        _, usuario_cmd, producto, cantidad_raw, unidad_cmd = [p.strip() for p in partes]
         if usuario_cmd != sesion["user"] and sesion["rol"] != "admin":
             send_and_close(cliente, b"No autorizado")
             continue
 
-        if not valid_field(producto, max_len=120) or not valid_field(cantidad, max_len=32):
-            send_and_close(cliente, b"Datos invalidos")
+        if not valid_field(producto, max_len=120):
+            send_and_close(cliente, b"Producto invalido")
             continue
+
+        cantidad = parse_positive_number(cantidad_raw)
+        if cantidad is None:
+            send_and_close(cliente, b"Cantidad invalida")
+            continue
+
+        catalog = load_catalog()
+        key = normalize_product(producto)
+        item = catalog.get(key)
+        if not item:
+            send_and_close(cliente, b"Producto no configurado por admin")
+            continue
+
+        if unidad_cmd.lower() != item["unidad"]:
+            send_and_close(cliente, b"Unidad no coincide con producto")
+            continue
+
+        detalle = (
+            f"{fecha} | {addr} | INVENTARIO|{usuario_cmd}|{item['nombre']}|"
+            f"{cantidad:.2f}|{item['unidad']}|{item['precio']:.2f}\n"
+        )
 
         try:
             with open(f"{BASE_PATH}/datos/inventario.txt", "a", encoding="utf-8") as f:
-                f.write(log_entry)
+                f.write(detalle)
             send_and_close(cliente, b"Inventario actualizado")
         except OSError:
             send_and_close(cliente, b"Error actualizando inventario")
@@ -421,5 +587,4 @@ while True:
 
         continue
 
-    # ================= DEFAULT =================
     send_and_close(cliente, b"Comando no reconocido")
