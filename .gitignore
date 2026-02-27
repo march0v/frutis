@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Runtime data
+logs/*.txt
+datos/*.txt
+
+# Sensitive local assets
+server.key
+server.crt
+usuarios.txt
