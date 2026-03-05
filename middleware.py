@@ -159,6 +159,38 @@ def sanitize_log_value(value):
     return value.replace("\n", "\\n").replace("\r", "\\r")
 
 
+def sanitize_command_for_log(command):
+    parts = command.split("|")
+    if not parts:
+        return sanitize_log_value(command)
+
+    action = parts[0].upper()
+
+    # Mask known password fields before writing commands to logs.
+    sensitive_fields = {
+        "LOGIN": [2],
+        "CREAR_USUARIO": [2],
+    }
+
+    for idx in sensitive_fields.get(action, []):
+        if idx < len(parts):
+            parts[idx] = "***"
+
+    return sanitize_log_value("|".join(parts))
+
+
+def sanitize_log_text(log_text):
+    safe_lines = []
+    for line in log_text.splitlines():
+        parts = line.split(" | ", 2)
+        if len(parts) == 3:
+            parts[2] = sanitize_command_for_log(parts[2])
+            safe_lines.append(" | ".join(parts))
+        else:
+            safe_lines.append(sanitize_log_value(line))
+    return "\n".join(safe_lines)
+
+
 def valid_field(value, max_len=64):
     if not value or len(value) > max_len:
         return False
@@ -401,7 +433,7 @@ while True:
         continue
 
     fecha = datetime.datetime.now()
-    safe_data = sanitize_log_value(command)
+    safe_data = sanitize_command_for_log(command)
     log_entry = f"{fecha} | {addr} | {safe_data}\n"
 
     try:
@@ -602,7 +634,7 @@ while True:
 
         try:
             with open(f"{BASE_PATH}/logs/log_general.txt", "r", encoding="utf-8") as f:
-                send_and_close(cliente, f.read())
+                send_and_close(cliente, sanitize_log_text(f.read()))
         except OSError:
             send_and_close(cliente, b"Sin logs")
 
@@ -701,7 +733,7 @@ while True:
         try:
             with open(f"{BASE_PATH}/logs/log_general.txt", "r", encoding="utf-8") as f:
                 lineas = f.readlines()[-15:]
-                send_and_close(cliente, "".join(lineas))
+                send_and_close(cliente, sanitize_log_text("".join(lineas)))
         except OSError:
             send_and_close(cliente, b"Sin actividad")
 
